@@ -49,6 +49,13 @@ const (
 	// its id, prevDigest and payload does not reproduce its declared digest:
 	// the body (or one of the signed fields) was tampered with.
 	ErrDigestMismatch ErrorCode = "DIGEST_MISMATCH"
+	// ErrHandoffAnchorMismatch is reported for the second batch's root in a
+	// dual-batch handoff when its prevDigest is not the first batch's rebuilt
+	// tail digest: the second batch does not attach where the first one ends.
+	ErrHandoffAnchorMismatch ErrorCode = "HANDOFF_ANCHOR_MISMATCH"
+	// ErrDuplicateIDAcrossBatches is reported once per id that occurs in both
+	// batches of a dual-batch handoff: the two uploads must be disjoint.
+	ErrDuplicateIDAcrossBatches ErrorCode = "DUPLICATE_ID_ACROSS_BATCHES"
 )
 
 // ChainError describes one integrity failure.
@@ -88,7 +95,7 @@ func Audit(events []Event) Report {
 		nodes[i] = graphNode{Event: e, Disclosed: true}
 	}
 
-	ordered, errs := auditNodes(nodes)
+	ordered, errs := auditNodes(nodes, zeroAnchor{})
 	if len(errs) > 0 {
 		return Report{Valid: false, Errors: errs}
 	}
@@ -105,10 +112,38 @@ func Audit(events []Event) Report {
 	}
 }
 
+// rootAnchor declares what the batch's single root event must anchor on. The
+// strict and limited entries require the all-zero digest; the second batch of
+// a dual-batch handoff must instead continue from the first batch's rebuilt
+// tail. A nil anchor skips the comparison entirely and is used when the first
+// batch is itself invalid: its tail digest does not exist, so a handoff anchor
+// can neither match nor mismatch — every other check still runs.
+type rootAnchor interface {
+	expectedRootPrevDigest() (string, bool)
+}
+
+// zeroAnchor requires the root to declare the all-zero digest.
+type zeroAnchor struct{}
+
+func (zeroAnchor) expectedRootPrevDigest() (string, bool) { return ZeroDigest, true }
+
+// tailAnchor requires the root to declare the previous batch's tail digest.
+type tailAnchor struct{ digest string }
+
+func (a tailAnchor) expectedRootPrevDigest() (string, bool) { return a.digest, true }
+
+// absentAnchor models a first batch that failed its own checks: the handoff
+// comparison is undefined and must be skipped.
+type absentAnchor struct{}
+
+func (absentAnchor) expectedRootPrevDigest() (string, bool) { return "", false }
+
 // auditNodes runs the complete order-independent check and, when no defect is
 // present, returns the single chain rebuilt root-to-tail. Structural checks
 // cover every node; the own-digest recomputation covers disclosed nodes only.
-func auditNodes(nodes []graphNode) (ordered []graphNode, errs []ChainError) {
+// The root's required prevDigest (zero for a standalone batch, the previous
+// batch tail for a handoff continuation) comes from anchor.
+func auditNodes(nodes []graphNode, anchor rootAnchor) (ordered []graphNode, errs []ChainError) {
 	byID := make(map[string]graphNode, len(nodes))
 	for _, n := range nodes {
 		byID[n.ID] = n
@@ -166,9 +201,16 @@ func auditNodes(nodes []graphNode) (ordered []graphNode, errs []ChainError) {
 		// mismatch on recomputation.
 
 		if e.ParentID == "" {
-			// The root event must anchor the chain on the all-zero digest.
-			if e.PrevDigest != ZeroDigest {
-				errs = append(errs, ChainError{Code: ErrRootPrevDigestNotZero, EventID: e.ID})
+			// The root event must anchor the batch on the required digest:
+			// all-zero for a standalone batch, the previous batch tail for a
+			// handoff continuation.
+			if want, ok := anchor.expectedRootPrevDigest(); ok && e.PrevDigest != want {
+				switch anchor.(type) {
+				case zeroAnchor:
+					errs = append(errs, ChainError{Code: ErrRootPrevDigestNotZero, EventID: e.ID})
+				default:
+					errs = append(errs, ChainError{Code: ErrHandoffAnchorMismatch, EventID: e.ID})
+				}
 			}
 		} else if parent, parentExists := byID[e.ParentID]; parentExists {
 			if e.PrevDigest != parent.Digest {

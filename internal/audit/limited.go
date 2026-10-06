@@ -83,12 +83,40 @@ func AuditLimited(events []LimitedEvent) LimitedReport {
 		nodes[i] = graphNode{Event: le.Event, Disclosed: le.Disclosed}
 	}
 
-	ordered, errs := auditNodes(nodes)
+	ordered, errs := auditNodes(nodes, zeroAnchor{})
 	if len(errs) > 0 {
 		return LimitedReport{Valid: false, Errors: errs}
 	}
 
-	// Locate the first withheld event in the rebuilt root-to-tail order.
+	results := buildLimitedResults(ordered)
+	status := chainStatusFor(ordered)
+	return LimitedReport{
+		Valid:      true,
+		Status:     status,
+		Errors:     []ChainError{},
+		Events:     results,
+		TailDigest: ordered[len(ordered)-1].Digest,
+	}
+}
+
+// chainStatusFor reports VERIFIED only when every rebuilt event was disclosed
+// (and therefore recomputed); any withheld body makes the whole chain PARTIAL.
+func chainStatusFor(ordered []graphNode) ChainStatus {
+	for _, n := range ordered {
+		if !n.Disclosed {
+			return ChainPartial
+		}
+	}
+	return ChainVerified
+}
+
+// buildLimitedResults renders rebuilt nodes with the trust status of each
+// position. The run before the first withheld event is VERIFIED_PREFIX (or
+// VERIFIED for every event when nothing is withheld); the first withheld event
+// and every successor are ANCHOR_UNVERIFIED, since they rest on an
+// unverifiable digest. Withheld payloads stay nil so they serialize as null
+// and no hidden body is ever echoed.
+func buildLimitedResults(ordered []graphNode) []LimitedEventResult {
 	firstHidden := -1
 	for i, n := range ordered {
 		if !n.Disclosed {
@@ -121,16 +149,5 @@ func AuditLimited(events []LimitedEvent) LimitedReport {
 		} // withheld: Payload stays nil and serializes as null; no body echoed.
 		results[i] = res
 	}
-
-	status := ChainVerified
-	if firstHidden != -1 {
-		status = ChainPartial
-	}
-	return LimitedReport{
-		Valid:      true,
-		Status:     status,
-		Errors:     []ChainError{},
-		Events:     results,
-		TailDigest: ordered[len(ordered)-1].Digest,
-	}
+	return results
 }

@@ -52,6 +52,14 @@ type limitedRequest struct {
 	Events []*limitedEventInput `json:"events"`
 }
 
+// handoffRequest is the dual-batch handoff envelope: two independently
+// uploaded batches whose events follow the limited-disclosure rules (payload
+// may be explicit null).
+type handoffRequest struct {
+	FirstBatch  []*limitedEventInput `json:"firstBatch"`
+	SecondBatch []*limitedEventInput `json:"secondBatch"`
+}
+
 // limitedEventInput keeps payload as a RawMessage so that a missing field
 // (nil/empty), an explicit JSON null (withheld) and a string (disclosed) are
 // three distinguishable cases.
@@ -64,8 +72,11 @@ type limitedEventInput struct {
 }
 
 // FieldError pinpoints one rejected field, indexed by the position of the event
-// in the request array (0-based).
+// in the request array (0-based). The handoff envelope additionally tags the
+// owning batch; the single-batch endpoints leave Batch empty, so their output
+// is unchanged.
 type FieldError struct {
+	Batch  string `json:"batch,omitempty"`
 	Index  *int   `json:"index,omitempty"`
 	Field  string `json:"field"`
 	Reason string `json:"reason"`
@@ -98,13 +109,20 @@ func NewMux() http.Handler {
 			Error: "use POST /audit/limited",
 		})
 	})
+	mux.HandleFunc("POST /audit/handoff", handleAuditHandoff)
+	mux.HandleFunc("/audit/handoff", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusMethodNotAllowed, invalidResponse{
+			Code:  "METHOD_NOT_ALLOWED",
+			Error: "use POST /audit/handoff",
+		})
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusNotFound, invalidResponse{
 			Code:  "NOT_FOUND",
-			Error: "unknown route; use POST /audit or POST /audit/limited",
+			Error: "unknown route; use POST /audit, POST /audit/limited or POST /audit/handoff",
 		})
 	})
 	return mux
@@ -154,8 +172,178 @@ func handleAuditLimited(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events := make([]audit.LimitedEvent, len(req.Events))
+	events := limitedEventsFromInputs(req.Events)
+
+	writeJSON(w, http.StatusOK, audit.AuditLimited(events))
+}
+
+// handleAuditHandoff serves the dual-batch handoff entry point. The two
+// batches are validated independently with the limited-disclosure rules; the
+// handoff-anchor and cross-batch id rules are audit conclusions, not request
+// errors. Withheld payloads never enter the process and are never echoed.
+func handleAuditHandoff(w http.ResponseWriter, r *http.Request) {
+	var req handoffRequest
+	if !decodeEnvelope(w, r, &req) {
+		return
+	}
+
+	fields := validateHandoff(req)
+	if len(fields) > 0 {
+		writeValidationFailed(w, fields)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, audit.AuditHandoff(audit.HandoffBatches{
+		FirstBatch:  limitedEventsFromInputs(req.FirstBatch),
+		SecondBatch: limitedEventsFromInputs(req.SecondBatch),
+	}))
+}
+
+// fieldErrors accumulates request-level field failures, indexed per event.
+type fieldErrors []FieldError
+
+func (f *fieldErrors) add(batch string, index int, field, reason string) {
+	i := index
+	*f = append(*f, FieldError{Batch: batch, Index: &i, Field: field, Reason: reason})
+}
+
+func (f *fieldErrors) addTop(batch, field, reason string) {
+	*f = append(*f, FieldError{Batch: batch, Field: field, Reason: reason})
+}
+
+func (f *fieldErrors) checkID(batch string, index int, id *string, seen map[string]struct{}) {
+	switch {
+	case id == nil:
+		f.add(batch, index, "id", "id is required")
+	case *id == "":
+		f.add(batch, index, "id", "id must not be empty")
+	case len(*id) > 0xffffffff:
+		f.add(batch, index, "id", "id length exceeds uint32 range")
+	default:
+		if _, dup := seen[*id]; dup {
+			f.add(batch, index, "id", "id must be unique within the batch")
+			return
+		}
+		seen[*id] = struct{}{}
+	}
+}
+
+func (f *fieldErrors) checkParent(batch string, index int, parent *string) {
+	// parentId marks the root when empty; any other value must resolve to an
+	// event (checked by the auditor).
+	if parent == nil {
+		f.add(batch, index, "parentId", "parentId is required (use an empty string for the root)")
+	}
+}
+
+func (f *fieldErrors) checkDigestField(batch string, index int, field string, value *string) {
+	switch {
+	case value == nil:
+		f.add(batch, index, field, field+" is required")
+	case !isHexDigest(*value):
+		f.add(batch, index, field, field+" must be 64 lowercase hexadecimal characters")
+	}
+}
+
+func validateStrict(req request) []FieldError {
+	var fields fieldErrors
+	if req.Events == nil {
+		fields.addTop("", "events", "events is required and must be an array")
+		return fields
+	}
+	if len(req.Events) < minEvents || len(req.Events) > maxEvents {
+		fields.addTop("", "events", "events must contain between 1 and 2000 items")
+		return fields
+	}
+	seen := make(map[string]struct{}, len(req.Events))
 	for i, in := range req.Events {
+		if in == nil {
+			fields.add("", i, "event", "event must be a JSON object")
+			continue
+		}
+		fields.checkID("", i, in.ID, seen)
+		fields.checkParent("", i, in.ParentID)
+		switch {
+		case in.Payload == nil:
+			fields.add("", i, "payload", "payload is required")
+		case len(*in.Payload) > 0xffffffff:
+			fields.add("", i, "payload", "payload length exceeds uint32 range")
+		}
+		fields.checkDigestField("", i, "prevDigest", in.PrevDigest)
+		fields.checkDigestField("", i, "digest", in.Digest)
+	}
+	return fields
+}
+
+func validateLimited(req limitedRequest) []FieldError {
+	var fields fieldErrors
+	if req.Events == nil {
+		fields.addTop("", "events", "events is required and must be an array")
+		return fields
+	}
+	validateLimitedEvents(&fields, "", req.Events)
+	return fields
+}
+
+// validateLimitedEvents applies the limited-disclosure per-event rules to one
+// batch. batch is empty for the single-batch endpoint and "firstBatch" or
+// "secondBatch" for the handoff envelope.
+func validateLimitedEvents(fields *fieldErrors, batch string, events []*limitedEventInput) {
+	if len(events) < minEvents || len(events) > maxEvents {
+		fields.addTop(batch, "events", "events must contain between 1 and 2000 items")
+		return
+	}
+	seen := make(map[string]struct{}, len(events))
+	for i, in := range events {
+		if in == nil {
+			fields.add(batch, i, "event", "event must be a JSON object")
+			continue
+		}
+		fields.checkID(batch, i, in.ID, seen)
+		fields.checkParent(batch, i, in.ParentID)
+		// A missing payload is still a request error; only an explicit null
+		// is the documented way to withhold the body.
+		switch payload, disclosed, ok := decodeLimitedPayload(in.Payload); {
+		case !ok:
+			// decodeLimitedPayload records no reason itself; classify here.
+			if len(in.Payload) == 0 {
+				fields.add(batch, i, "payload", "payload is required (use null to withhold it)")
+			} else {
+				fields.add(batch, i, "payload", "payload must be a JSON string or null")
+			}
+		case disclosed && len(payload) > 0xffffffff:
+			fields.add(batch, i, "payload", "payload length exceeds uint32 range")
+		}
+		fields.checkDigestField(batch, i, "prevDigest", in.PrevDigest)
+		fields.checkDigestField(batch, i, "digest", in.Digest)
+	}
+}
+
+// validateHandoff validates both batches independently with the same shape and
+// size rules as the single-batch limited endpoint, tagging every field error
+// with its owning batch. Cross-batch id disjointness is an audit-level rule
+// (reported in the 200 audit response), not a 422 request error.
+func validateHandoff(req handoffRequest) []FieldError {
+	var fields fieldErrors
+	if req.FirstBatch == nil {
+		fields.addTop("firstBatch", "firstBatch", "firstBatch is required and must be an array")
+	} else {
+		validateLimitedEvents(&fields, "firstBatch", req.FirstBatch)
+	}
+	if req.SecondBatch == nil {
+		fields.addTop("secondBatch", "secondBatch", "secondBatch is required and must be an array")
+	} else {
+		validateLimitedEvents(&fields, "secondBatch", req.SecondBatch)
+	}
+	return fields
+}
+
+// limitedEventsFromInputs converts validated limited-event inputs into audit
+// events. Validation must already have guaranteed payload is present as either
+// a string or explicit null; null stays Disclosed=false with no body.
+func limitedEventsFromInputs(inputs []*limitedEventInput) []audit.LimitedEvent {
+	events := make([]audit.LimitedEvent, len(inputs))
+	for i, in := range inputs {
 		le := audit.LimitedEvent{
 			Event: audit.Event{
 				ID:         *in.ID,
@@ -164,129 +352,13 @@ func handleAuditLimited(w http.ResponseWriter, r *http.Request) {
 				Digest:     *in.Digest,
 			},
 		}
-		// Validation above already guaranteed payload is present as either
-		// string or null; null simply stays Disclosed=false with no body.
 		if payload, disclosed, _ := decodeLimitedPayload(in.Payload); disclosed {
 			le.Payload = payload
 			le.Disclosed = true
 		}
 		events[i] = le
 	}
-
-	writeJSON(w, http.StatusOK, audit.AuditLimited(events))
-}
-
-// fieldErrors accumulates request-level field failures, indexed per event.
-type fieldErrors []FieldError
-
-func (f *fieldErrors) add(index int, field, reason string) {
-	i := index
-	*f = append(*f, FieldError{Index: &i, Field: field, Reason: reason})
-}
-
-func (f *fieldErrors) addTop(field, reason string) {
-	*f = append(*f, FieldError{Field: field, Reason: reason})
-}
-
-func (f *fieldErrors) checkID(index int, id *string, seen map[string]struct{}) {
-	switch {
-	case id == nil:
-		f.add(index, "id", "id is required")
-	case *id == "":
-		f.add(index, "id", "id must not be empty")
-	case len(*id) > 0xffffffff:
-		f.add(index, "id", "id length exceeds uint32 range")
-	default:
-		if _, dup := seen[*id]; dup {
-			f.add(index, "id", "id must be unique within the batch")
-			return
-		}
-		seen[*id] = struct{}{}
-	}
-}
-
-func (f *fieldErrors) checkParent(index int, parent *string) {
-	// parentId marks the root when empty; any other value must resolve to an
-	// event (checked by the auditor).
-	if parent == nil {
-		f.add(index, "parentId", "parentId is required (use an empty string for the root)")
-	}
-}
-
-func (f *fieldErrors) checkDigestField(index int, field string, value *string) {
-	switch {
-	case value == nil:
-		f.add(index, field, field+" is required")
-	case !isHexDigest(*value):
-		f.add(index, field, field+" must be 64 lowercase hexadecimal characters")
-	}
-}
-
-func validateStrict(req request) []FieldError {
-	var fields fieldErrors
-	if req.Events == nil {
-		fields.addTop("events", "events is required and must be an array")
-		return fields
-	}
-	if len(req.Events) < minEvents || len(req.Events) > maxEvents {
-		fields.addTop("events", "events must contain between 1 and 2000 items")
-		return fields
-	}
-	seen := make(map[string]struct{}, len(req.Events))
-	for i, in := range req.Events {
-		if in == nil {
-			fields.add(i, "event", "event must be a JSON object")
-			continue
-		}
-		fields.checkID(i, in.ID, seen)
-		fields.checkParent(i, in.ParentID)
-		switch {
-		case in.Payload == nil:
-			fields.add(i, "payload", "payload is required")
-		case len(*in.Payload) > 0xffffffff:
-			fields.add(i, "payload", "payload length exceeds uint32 range")
-		}
-		fields.checkDigestField(i, "prevDigest", in.PrevDigest)
-		fields.checkDigestField(i, "digest", in.Digest)
-	}
-	return fields
-}
-
-func validateLimited(req limitedRequest) []FieldError {
-	var fields fieldErrors
-	if req.Events == nil {
-		fields.addTop("events", "events is required and must be an array")
-		return fields
-	}
-	if len(req.Events) < minEvents || len(req.Events) > maxEvents {
-		fields.addTop("events", "events must contain between 1 and 2000 items")
-		return fields
-	}
-	seen := make(map[string]struct{}, len(req.Events))
-	for i, in := range req.Events {
-		if in == nil {
-			fields.add(i, "event", "event must be a JSON object")
-			continue
-		}
-		fields.checkID(i, in.ID, seen)
-		fields.checkParent(i, in.ParentID)
-		// A missing payload is still a request error; only an explicit null
-		// is the documented way to withhold the body.
-		switch payload, disclosed, ok := decodeLimitedPayload(in.Payload); {
-		case !ok:
-			// decodeLimitedPayload records no reason itself; classify here.
-			if len(in.Payload) == 0 {
-				fields.add(i, "payload", "payload is required (use null to withhold it)")
-			} else {
-				fields.add(i, "payload", "payload must be a JSON string or null")
-			}
-		case disclosed && len(payload) > 0xffffffff:
-			fields.add(i, "payload", "payload length exceeds uint32 range")
-		}
-		fields.checkDigestField(i, "prevDigest", in.PrevDigest)
-		fields.checkDigestField(i, "digest", in.Digest)
-	}
-	return fields
+	return events
 }
 
 // decodeLimitedPayload interprets one payload value for the limited entry

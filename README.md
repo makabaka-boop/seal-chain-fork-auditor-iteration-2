@@ -14,6 +14,9 @@
 > **跨馆交接（有限披露）**：部分证物正文不能向审计员披露时，使用
 > `POST /audit/limited`：`payload` 写成显式 `null` 表示**未披露**。缺正文
 > 不会被当作整链验真——见下文[有限披露审计](#有限披露审计-post-auditlimited)。
+> 证物从一座馆转交另一座馆、两馆各自上传一批乱序事件时，使用
+> `POST /audit/handoff` 同时核对两批：第二批的根锚点必须等于第一批图重建
+> 得到的尾摘要——见下文[双批次交接审计](#双批次交接审计-post-audithandoff)。
 
 ## 目录结构
 
@@ -205,6 +208,74 @@ curl -sS localhost:8080/audit -H 'Content-Type: application/json' -d '{
 `events` 顺序由图重建，与上传顺序无关；结构损坏时 `events`、`status`、
 `tailDigest` 均省略，形态与严格入口一致。
 
+## 双批次交接审计 `POST /audit/handoff`
+
+证物从一座馆转交另一座馆后，两馆各自上传**一批**（批内同样乱序）封签
+事件。新接口在一次审计中证明第二批确实接在第一批尾部，原两个入口
+（`/audit`、`/audit/limited`）及其错误顺序均不改变。
+
+请求体为两个批次，批内事件沿用有限披露的完全相同结构、摘要字节定义与
+`payload: null` 隐藏规则：
+
+```json
+{
+  "firstBatch":  [ { ... 第一批事件 } ],
+  "secondBatch": [ { ... 第二批事件 } ]
+}
+```
+
+- 每批各须包含 **1 至 2000** 条事件；字段级校验与 `/audit/limited` 完全
+  相同，字段错误在原有 `index`/`field`/`reason` 之外附 `batch`
+  （`"firstBatch"` / `"secondBatch"`，原两个入口不输出该字段）；
+- **第一批**仍由全零根锚开始：其唯一根的 `prevDigest` 必须全零；
+- **第二批的根**在批内没有 `parentId`（仍为空串，且批内仍须恰好一个根），
+  它的 `prevDigest` **必须等于第一批经图重建得到的尾摘要**——而不是全零；
+- 两批事件 **ID 不得重复**：跨批重复的 id 由审计结论
+  `DUPLICATE_ID_ACROSS_BATCHES` 报告（批内重复仍是 422，二者不混同）；
+- 两批各自完成与单批完全相同的批内核查：唯一根、可解析前驱、无分叉、
+  无环、每条 `prevDigest` 等于批内父事件声明的 `digest`、已披露事件摘要
+  逐字节复算。
+
+**交接检查与批内核查一并完成**：第一批无效、第二批无效、跨批重复 ID、
+锚点不符中的任何一项成立，都只返回按 `(code, eventId)` 排序去重的错误，
+**不输出可信拼接链**（无 `events`/`status`/`tailDigest`）。当第一批本身
+无效时其尾摘要不存在，锚点比对无定义因而跳过（不会凭空产生
+`HANDOFF_ANCHOR_MISMATCH`），但第二批批内核查与跨批重复 ID 检查照常进行。
+
+新增审计错误码：
+
+| code | eventId 指向 | 含义 |
+|---|---|---|
+| `HANDOFF_ANCHOR_MISMATCH` | 第二批的根事件 | 第二批根的 `prevDigest` ≠ 第一批重建尾摘要 |
+| `DUPLICATE_ID_ACROSS_BATCHES` | 重复的事件 id（每 id 一次） | 同一 id 在两批中均出现 |
+
+结构全部成立时，返回跨两批拼接的**单一**根→尾序列（第一批根到第二批尾）
+与第二批尾摘要，形态与有限披露响应一致，并沿拼接后的完整序列传播信任：
+
+- 从首事件到末事件**全部披露且逐字节复算**才标为 `VERIFIED`；
+- **第一批只要存在未披露正文，第二批即使全部披露也只能继承
+  “锚点未验证”**：第一个未披露事件及其后（含整个第二批）均为
+  `ANCHOR_UNVERIFIED`，整链永远是 `PARTIAL`；
+- 未披露正文同样**绝不回显**，响应中固定为 `"payload":null`。
+
+```json
+{
+  "valid": true,
+  "status": "PARTIAL",
+  "errors": [],
+  "events": [
+    {"id":"h0","parentId":"","payload":"body-0","prevDigest":"000…000",
+     "digest":"…","status":"VERIFIED_PREFIX"},
+    {"id":"h1","parentId":"h0","payload":null,"prevDigest":"…",
+     "digest":"…","status":"ANCHOR_UNVERIFIED"},
+    {"id":"h2","parentId":"","payload":"body-2","prevDigest":"<h1 尾摘要>",
+     "digest":"…","status":"ANCHOR_UNVERIFIED"},
+    {"id":"h3","parentId":"h2","payload":"body-3","prevDigest":"…",
+     "digest":"…","status":"ANCHOR_UNVERIFIED"}
+  ],
+  "tailDigest": "<第二批尾事件声明 digest>"
+}
+```
 
 ## 测试
 
@@ -240,3 +311,15 @@ make cover      # 覆盖率报告
     照常报错；乱序上传 50 轮重建顺序与状态不变；
   - `/audit` 上 `payload:null` 仍 422，`/audit/limited` 上字段缺失/错类型
     仍 422，严格五字段语义不变。
+- **双批次交接**（独立固定向量 h0..h3，Python 预算，在 h1/h2 之间切批）：
+  - 两批各自乱序上传 50 轮，均拼接重建出相同的 h0→h3 序列、尾摘要与
+    `VERIFIED` 状态；
+  - 第二批根锚点伪造（全零或外值，自身摘要一致）→ 仅
+    `HANDOFF_ANCHOR_MISMATCH`，且全零锚点规则只作用于第一批；
+  - 第一批根锚点非零、正文篡改、批内断链、第二批多根等沿用原错误码，
+    不出拼接链；第一批无效时跳过锚点比对但跨批重复 ID 仍报；
+  - 跨批重复 ID → 仅 `DUPLICATE_ID_ACROSS_BATCHES`；批内重复 ID 仍 422；
+  - 隐藏第一批尾事件 → 第二批即使全披露也整段 `ANCHOR_UNVERIFIED`、
+    整链 `PARTIAL`；全披露后才 `VERIFIED`；隐藏正文不进输出字节；
+  - 两批错误合并为同一列表，仍按 `(code, eventId)` 排序；原两个入口的
+    行为与错误顺序保持不变。
