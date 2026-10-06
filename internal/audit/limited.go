@@ -78,17 +78,106 @@ type LimitedReport struct {
 // ANCHOR_UNVERIFIED, even if its own body would recompute. With no withheld
 // event the whole chain is VERIFIED.
 func AuditLimited(events []LimitedEvent) LimitedReport {
+	nodes := limitedNodes(events)
+
+	ordered, errs := auditNodes(nodes, zeroRootAnchorCheck())
+	if len(errs) > 0 {
+		return LimitedReport{Valid: false, Errors: errs}
+	}
+	return successfulLimitedReport(ordered)
+}
+
+// HandoffRequest contains the two independently uploaded batches involved in a
+// transfer. Each batch is internally represented by its own root-to-tail graph;
+// the second root's parentId remains empty, while its prevDigest is the
+// cryptographic handoff link to the first batch's rebuilt tail.
+type HandoffRequest struct {
+	FirstBatch  []LimitedEvent
+	SecondBatch []LimitedEvent
+}
+
+// AuditLimitedHandoff validates two limited-disclosure batches together. The
+// first batch must begin at the all-zero root anchor. The second batch is
+// checked exactly like a batch of its own, except its sole root's prevDigest
+// must equal the first batch's tail digest obtained from graph reconstruction.
+// An id present in both batches is invalid even when the two internal graphs
+// are otherwise intact.
+//
+// Verification status spans the concatenated chain: every event from the first
+// hidden event onward, including every second-batch event, is
+// ANCHOR_UNVERIFIED. The whole report is VERIFIED only when every event in
+// both batches is disclosed and every digest can be recomputed.
+func AuditLimitedHandoff(firstBatch, secondBatch []LimitedEvent) LimitedReport {
+	return AuditLimitedHandoffRequest(HandoffRequest{
+		FirstBatch:  firstBatch,
+		SecondBatch: secondBatch,
+	})
+}
+
+// AuditHandoff is a concise alias for AuditLimitedHandoff.
+func AuditHandoff(firstBatch, secondBatch []LimitedEvent) LimitedReport {
+	return AuditLimitedHandoff(firstBatch, secondBatch)
+}
+
+// AuditLimitedHandoffRequest is the grouped form of AuditLimitedHandoff used by
+// callers that want to preserve the request's two-batch boundary.
+func AuditLimitedHandoffRequest(req HandoffRequest) LimitedReport {
+	firstNodes := limitedNodes(req.FirstBatch)
+	secondNodes := limitedNodes(req.SecondBatch)
+
+	firstOrdered, firstErrs := auditNodes(firstNodes, zeroRootAnchorCheck())
+	var secondAnchor *rootAnchorCheck
+	if len(firstOrdered) > 0 {
+		secondAnchor = &rootAnchorCheck{
+			digest:         firstOrdered[len(firstOrdered)-1].Digest,
+			mismatch:       ErrHandoffDigestMismatch,
+			singleRootOnly: true,
+		}
+	}
+	secondOrdered, secondErrs := auditNodes(secondNodes, secondAnchor)
+
+	errs := append(append([]ChainError{}, firstErrs...), secondErrs...)
+	errs = append(errs, crossBatchDuplicateErrors(firstNodes, secondNodes)...)
+	if len(errs) > 0 {
+		return LimitedReport{Valid: false, Errors: dedupeAndSort(errs)}
+	}
+
+	ordered := make([]graphNode, 0, len(firstOrdered)+len(secondOrdered))
+	ordered = append(ordered, firstOrdered...)
+	ordered = append(ordered, secondOrdered...)
+
+	return successfulLimitedReport(ordered)
+}
+
+func limitedNodes(events []LimitedEvent) []graphNode {
 	nodes := make([]graphNode, len(events))
 	for i, le := range events {
 		nodes[i] = graphNode{Event: le.Event, Disclosed: le.Disclosed}
 	}
+	return nodes
+}
 
-	ordered, errs := auditNodes(nodes)
-	if len(errs) > 0 {
-		return LimitedReport{Valid: false, Errors: errs}
+func crossBatchDuplicateErrors(first, second []graphNode) []ChainError {
+	firstIDs := make(map[string]struct{}, len(first))
+	for _, n := range first {
+		firstIDs[n.ID] = struct{}{}
 	}
+	seen := make(map[string]struct{})
+	var errs []ChainError
+	for _, n := range second {
+		if _, inFirst := firstIDs[n.ID]; !inFirst {
+			continue
+		}
+		if _, reported := seen[n.ID]; reported {
+			continue
+		}
+		seen[n.ID] = struct{}{}
+		errs = append(errs, ChainError{Code: ErrCrossBatchDuplicateID, EventID: n.ID})
+	}
+	return errs
+}
 
-	// Locate the first withheld event in the rebuilt root-to-tail order.
+func successfulLimitedReport(ordered []graphNode) LimitedReport {
 	firstHidden := -1
 	for i, n := range ordered {
 		if !n.Disclosed {
@@ -118,7 +207,7 @@ func AuditLimited(events []LimitedEvent) LimitedReport {
 		if n.Disclosed {
 			payload := n.Payload
 			res.Payload = &payload
-		} // withheld: Payload stays nil and serializes as null; no body echoed.
+		}
 		results[i] = res
 	}
 

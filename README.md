@@ -205,6 +205,49 @@ curl -sS localhost:8080/audit -H 'Content-Type: application/json' -d '{
 `events` 顺序由图重建，与上传顺序无关；结构损坏时 `events`、`status`、
 `tailDigest` 均省略，形态与严格入口一致。
 
+## 双批次交接审计 `POST /audit/handoff`
+
+证物从一座馆转交给另一座馆后，两座馆分别上传自己的乱序批次。交接接口
+同时接收两个批次，并在一次审计中完成**批内核查 + 跨批交接核查**：
+
+```json
+{
+  "firstBatch":  {"events": [ /* 第一批，结构同 /audit/limited */ ]},
+  "secondBatch": {"events": [ /* 第二批，结构同 /audit/limited */ ]}
+}
+```
+
+规则：
+
+- 第一批必须有自己的唯一根，且根 `prevDigest` 为全零；
+- 第二批也必须有自己的唯一根；第二批根的 `parentId` 仍为空串，**不**通过
+  `parentId` 跨批引用，但它的 `prevDigest` 必须等于第一批**经图重建**得到的
+  尾事件声明摘要；
+- 两批内部都执行既有规则：唯一根、前驱存在、无分叉、无环、批内
+  `prevDigest` 链接一致，并对已披露正文重算摘要；
+- 两批之间的事件 ID 不得重复；
+- 两个批次都允许显式 `payload:null`，隐藏正文不会进入服务，也不会回显。
+
+新增审计错误码：
+
+| code | eventId 指向 | 含义 |
+|---|---|---|
+| `HANDOFF_DIGEST_MISMATCH` | 第二批根事件 | 第二批根 `prevDigest` ≠ 第一批重建尾摘要 |
+| `CROSS_BATCH_DUPLICATE_ID` | 重复事件 | 同一 ID 同时出现在两个批次 |
+
+任一批结构/摘要无效、交接锚点不符或跨批 ID 重复时，HTTP 200 返回
+`valid:false` 与按 `(code,eventId)` 排序去重的错误，不返回 `events`、
+`status` 或 `tailDigest`。全部通过时，响应仍使用有限披露报告形态，
+`events` 是按两批图重建后拼接的根→尾序列，`tailDigest` 是第二批尾摘要。
+
+信任状态跨批传播：
+
+- 两个批次全部披露且全部摘要可复算：每个事件和整链均为 `VERIFIED`；
+- 只要第一批存在隐藏正文，第二批即使全部披露，第二批事件也只能是
+  `ANCHOR_UNVERIFIED`，整链为 `PARTIAL`；
+- 只有从第一事件到最后事件均可复算，才标记为完全验证。
+
+原有 `POST /audit` 与 `POST /audit/limited` 的请求、响应和错误顺序均不变。
 
 ## 测试
 
@@ -240,3 +283,7 @@ make cover      # 覆盖率报告
     照常报错；乱序上传 50 轮重建顺序与状态不变；
   - `/audit` 上 `payload:null` 仍 422，`/audit/limited` 上字段缺失/错类型
     仍 422，严格五字段语义不变。
+- **双批次交接**：独立固定向量 v0..v3 + h0..h1；两批均乱序上传，验证图重建、
+  批内断链、错误交接锚点、全零第二批锚点、跨批重复 ID；第一批隐藏事件后，
+  第二批全披露仍全部继承 `ANCHOR_UNVERIFIED`；全部披露才为 `VERIFIED`；
+  隐藏正文不回显，无效时不输出拼接链。

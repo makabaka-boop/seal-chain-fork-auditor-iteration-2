@@ -33,22 +33,29 @@ const (
 	// ErrMissingParent is reported for an event whose parentId does not
 	// refer to any event in the batch.
 	ErrMissingParent ErrorCode = "MISSING_PARENT"
-	// ErrFork is reported once per parent with more than one child. The
-	// eventId carries the parent id that forks.
-	ErrFork ErrorCode = "FORK"
 	// ErrCycle is reported for every event that lies on a directed cycle.
 	ErrCycle ErrorCode = "CYCLE"
-	// ErrRootPrevDigestNotZero is reported when the (single) root event
-	// declares a non-zero prevDigest.
-	ErrRootPrevDigestNotZero ErrorCode = "ROOT_PREV_DIGEST_NOT_ZERO"
-	// ErrPrevDigestMismatch is reported when a non-root event's prevDigest
-	// differs from its parent event's declared digest: a broken or
-	// re-wired link.
-	ErrPrevDigestMismatch ErrorCode = "PREV_DIGEST_MISMATCH"
+	// ErrCrossBatchDuplicateID is reported for every event id that occurs in
+	// both batches of a handoff audit.
+	ErrCrossBatchDuplicateID ErrorCode = "CROSS_BATCH_DUPLICATE_ID"
 	// ErrDigestMismatch is reported when recomputing an event digest from
 	// its id, prevDigest and payload does not reproduce its declared digest:
 	// the body (or one of the signed fields) was tampered with.
 	ErrDigestMismatch ErrorCode = "DIGEST_MISMATCH"
+	// ErrFork is reported once per parent with more than one child. The
+	// eventId carries the parent id that forks.
+	ErrFork ErrorCode = "FORK"
+	// ErrHandoffDigestMismatch is reported on the second batch's root when
+	// its declared prevDigest does not equal the rebuilt first-batch tail
+	// digest. The second batch has no parentId edge for that link.
+	ErrHandoffDigestMismatch ErrorCode = "HANDOFF_DIGEST_MISMATCH"
+	// ErrPrevDigestMismatch is reported when a non-root event's prevDigest
+	// differs from its parent event's declared digest: a broken or
+	// re-wired link.
+	ErrPrevDigestMismatch ErrorCode = "PREV_DIGEST_MISMATCH"
+	// ErrRootPrevDigestNotZero is reported when the (single) root event
+	// declares a non-zero prevDigest.
+	ErrRootPrevDigestNotZero ErrorCode = "ROOT_PREV_DIGEST_NOT_ZERO"
 )
 
 // ChainError describes one integrity failure.
@@ -77,6 +84,19 @@ type graphNode struct {
 	Disclosed bool
 }
 
+// rootAnchorCheck describes the external digest that a batch root must anchor
+// to. A nil value skips the root-digest check; standalone batches use the
+// all-zero digest, while a second handoff batch uses the first batch tail.
+type rootAnchorCheck struct {
+	digest         string
+	mismatch       ErrorCode
+	singleRootOnly bool
+}
+
+func zeroRootAnchorCheck() *rootAnchorCheck {
+	return &rootAnchorCheck{digest: ZeroDigest, mismatch: ErrRootPrevDigestNotZero}
+}
+
 // Audit checks a batch of events independently of upload order.
 //
 // Every detectable defect is collected in one pass. Validation of fields and
@@ -88,7 +108,7 @@ func Audit(events []Event) Report {
 		nodes[i] = graphNode{Event: e, Disclosed: true}
 	}
 
-	ordered, errs := auditNodes(nodes)
+	ordered, errs := auditNodes(nodes, zeroRootAnchorCheck())
 	if len(errs) > 0 {
 		return Report{Valid: false, Errors: errs}
 	}
@@ -108,7 +128,8 @@ func Audit(events []Event) Report {
 // auditNodes runs the complete order-independent check and, when no defect is
 // present, returns the single chain rebuilt root-to-tail. Structural checks
 // cover every node; the own-digest recomputation covers disclosed nodes only.
-func auditNodes(nodes []graphNode) (ordered []graphNode, errs []ChainError) {
+// rootAnchor describes the digest that the batch's sole root must declare.
+func auditNodes(nodes []graphNode, rootAnchor *rootAnchorCheck) (ordered []graphNode, errs []ChainError) {
 	byID := make(map[string]graphNode, len(nodes))
 	for _, n := range nodes {
 		byID[n.ID] = n
@@ -166,9 +187,12 @@ func auditNodes(nodes []graphNode) (ordered []graphNode, errs []ChainError) {
 		// mismatch on recomputation.
 
 		if e.ParentID == "" {
-			// The root event must anchor the chain on the all-zero digest.
-			if e.PrevDigest != ZeroDigest {
-				errs = append(errs, ChainError{Code: ErrRootPrevDigestNotZero, EventID: e.ID})
+			// A single root anchors the batch. For the original standalone
+			// audits, every root is also anchor-checked for unchanged error
+			// behavior when a malformed graph has several roots.
+			if rootAnchor != nil && (!rootAnchor.singleRootOnly || len(roots) == 1) &&
+				e.PrevDigest != rootAnchor.digest {
+				errs = append(errs, ChainError{Code: rootAnchor.mismatch, EventID: e.ID})
 			}
 		} else if parent, parentExists := byID[e.ParentID]; parentExists {
 			if e.PrevDigest != parent.Digest {
