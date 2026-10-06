@@ -1,0 +1,20 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sealaudit:latest
+    container_name: sealaudit-api
+    ports:
+      - "8080:8080"
+    environment:
+      SEAL_AUDIT_ADDR: ":8080"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/sealaudit", "-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
